@@ -256,12 +256,7 @@ static void sbdd_delete(void)
 {
 	atomic_set(&__sbdd.deleting, 1);
 
-	if (!wait_event_timeout(__sbdd.exitwait,
-	                        !atomic_read(&__sbdd.refs_cnt),
-	                        msecs_to_jiffies(1000))) {
-		pr_err("call sbdd_delete() failed, timed out\n");
-		return;
-	}
+	wait_event(__sbdd.exitwait, !atomic_read(&__sbdd.refs_cnt));
 
 	/* gd will be removed only after the last reference put */
 	if (__sbdd.gd) {
