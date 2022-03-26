@@ -24,10 +24,80 @@
 #include <linux/blk-mq.h>
 #endif
 
+static int sbdd_match(struct device *dev, struct device_driver *drv);
+
+static int sbdd_uevent(struct device *dev, struct kobj_uevent_env *env);
+
+static struct bus_type sbdd_bus_type = {
+    .name ="sbdd_bus",
+    .match = sbdd_match,
+    .uevent = sbdd_uevent
+};
+
+static int sbdd_match(struct device *dev, struct device_driver *drv)
+{
+    return !strcmp(dev->type->name, drv->name);
+}
+
+static int sbdd_uevent(struct device *dev, struct kobj_uevent_env *env)
+{
+    return 0;
+}
+
+static int sbdd_bus_register(void)
+{
+    int ret = 0;
+    pr_info("Registering sbdd_bus");
+    ret = bus_register(&sbdd_bus_type);
+    if(ret)
+        pr_err("Error registering sbdd_bus_type with code %d", ret);
+    else
+        pr_info("sbdd_bus registered successfully");
+    return ret;
+}
+
+static void sbdd_bus_unregister(void)
+{
+    bus_unregister(&sbdd_bus_type);
+    pr_info("Unregistering sbdd_bus");
+}
+
+struct sbd_driver{
+    struct module *owner;
+    struct device_driver driver;
+};
+
+int register_sbd_driver(struct sbd_driver *driver)
+{
+    int ret = 0;
+    pr_info("Registering sbd_driver");
+    driver->driver.bus = &sbdd_bus_type;
+    ret = driver_register(&driver->driver);
+    if(ret){
+        pr_err("Registering sbd_driver failed with code %d", ret);
+        return ret;
+    }
+    return ret;
+}
+
+void unregister_sbd_driver(struct sbd_driver *driver)
+{
+    driver_unregister(&driver->driver);
+    pr_info("Unregistered sbd_driver");
+}
+
+static struct sbd_driver sbddrv = {
+    .owner = THIS_MODULE,
+    .driver = {
+        .name = "sbdd"
+    }
+};
+
 #define SBDD_SECTOR_SHIFT      9
 #define SBDD_SECTOR_SIZE       (1 << SBDD_SECTOR_SHIFT)
 #define SBDD_MIB_SECTORS       (1 << (20 - SBDD_SECTOR_SHIFT))
 #define SBDD_NAME              "sbdd"
+#define SBDDEV_NAME            "sba"
 
 struct sbdd {
 	wait_queue_head_t       exitwait;
@@ -238,7 +308,7 @@ static int sbdd_create(void)
 	__sbdd.gd->first_minor = 0;
 	__sbdd.gd->fops = &__sbdd_bdev_ops;
 	/* Represents name in /proc/partitions and /sys/block */
-	scnprintf(__sbdd.gd->disk_name, DISK_NAME_LEN, SBDD_NAME);
+    scnprintf(__sbdd.gd->disk_name, DISK_NAME_LEN, SBDDEV_NAME);
 	set_capacity(__sbdd.gd, __sbdd.capacity);
 
 	/*
@@ -306,15 +376,28 @@ static int __init sbdd_init(void)
 	int ret = 0;
 
 	pr_info("starting initialization...\n");
+    ret = sbdd_bus_register();
+    if(ret){
+        pr_warn("initialization failed\n");
+        goto unregister_bus;
+    }
+    ret = register_sbd_driver(&sbddrv);
+    if(ret){
+        pr_warn("initialization failed\n");
+        goto unregister_driver;
+    }
 	ret = sbdd_create();
 
 	if (ret) {
 		pr_warn("initialization failed\n");
-		sbdd_delete();
+        goto sbdd_delete;
 	} else {
 		pr_info("initialization complete\n");
+        return ret;
 	}
-
+    sbdd_delete: sbdd_delete();
+    unregister_driver: unregister_sbd_driver(&sbddrv);
+    unregister_bus: sbdd_bus_unregister();
 	return ret;
 }
 
@@ -327,6 +410,8 @@ static void __exit sbdd_exit(void)
 {
 	pr_info("exiting...\n");
 	sbdd_delete();
+    unregister_sbd_driver(&sbddrv);
+    sbdd_bus_unregister();
 	pr_info("exiting complete\n");
 }
 
