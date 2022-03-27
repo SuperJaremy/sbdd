@@ -24,6 +24,27 @@
 #include <linux/blk-mq.h>
 #endif
 
+static unsigned int     __pre_mode = 0;
+enum mode{AUTO = 0, USER};
+static enum mode __mode = AUTO;
+
+static int check_mode(void){
+    if(__pre_mode == 0 || __pre_mode == 1){
+        __mode = __pre_mode;
+        switch(__mode){
+        case AUTO:
+            pr_info("working in auto mode\n");
+            break;
+        case USER:
+            pr_info("working in user mode\n");
+        }
+
+        return 0;
+    }
+    pr_warn("incorrect mode. auto mode will be used instead\n");
+    return 1;
+}
+
 
 #define SBDD_BUS_NAME "sbdd_bus"
 #define MAX_DEV_NAME_SIZE 8
@@ -91,6 +112,8 @@ int register_sbd_driver(struct sbd_driver *driver)
         pr_err("Registering sbd_driver failed with code %d\n", ret);
         return ret;
     }
+    if(__mode == AUTO)
+        return ret;
     driver->command_attr.attr.name = "command";
     driver->command_attr.attr.mode = S_IWUSR;
     driver->command_attr.store = execute_command;
@@ -107,7 +130,8 @@ int register_sbd_driver(struct sbd_driver *driver)
 
 void unregister_sbd_driver(struct sbd_driver *driver)
 {
-    driver_remove_file(&driver->driver, &driver->command_attr);
+    if(__mode == USER)
+        driver_remove_file(&driver->driver, &driver->command_attr);
     driver_unregister(&driver->driver);
     pr_info("unregistered sbd_driver\n");
 }
@@ -207,6 +231,7 @@ static ssize_t execute_command(struct device_driver *driver, const char *buf,
 #define SBDD_NAME              "sbdd"
 #define SBDEV_NAME             "sbd"
 #define MAX_DEVICES            16
+#define DEFAULT_CAPACITY_MIB   100
 
 struct sbdd {
 	wait_queue_head_t       exitwait;
@@ -460,6 +485,14 @@ static int sbdd_create(void)
         pr_err("cannot allocate memory for the devices\n");
         return -ENOMEM;
     }
+    if(__mode == AUTO){
+        int i;
+        for(i = 0; i < MAX_DEVICES; i++){
+            char name[5] = {0};
+            sprintf(name, "%s%x", SBDEV_NAME, i);
+            add_new_sbdd(DEFAULT_CAPACITY_MIB, name, 5);
+        }
+    }
 	return ret;
 }
 
@@ -519,10 +552,12 @@ There is also __initdata note, same but used for variables.
 */
 static int __init sbdd_init(void)
 {
+
 	int ret = 0;
     memset(&__zero_sbdd, 0, sizeof (struct sbdd));
 
 	pr_info("starting initialization...\n");
+    check_mode();
     ret = sbdd_bus_register();
     if(ret){
         pr_warn("initialization failed\n");
@@ -570,6 +605,9 @@ module_exit(sbdd_exit);
 
 /* Set desired capacity with insmod */
 module_param_named(capacity_mib, __sbdd_capacity_mib, ulong, S_IRUGO);
+
+/* Set driver mode: 0 - disks are created automatically, 1 - disks are created by user */
+module_param_named(mode, __pre_mode, uint, S_IRUGO);
 
 /* Note for the kernel: a free license module. A warning will be outputted without it. */
 MODULE_LICENSE("GPL");
