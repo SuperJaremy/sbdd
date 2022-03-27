@@ -24,6 +24,10 @@
 #include <linux/blk-mq.h>
 #endif
 
+/*
+ * Creating our own bus to register driver on it
+ */
+
 static int sbdd_match(struct device *dev, struct device_driver *drv);
 
 static int sbdd_uevent(struct device *dev, struct kobj_uevent_env *env);
@@ -50,48 +54,110 @@ static int sbdd_bus_register(void)
     pr_info("Registering sbdd_bus");
     ret = bus_register(&sbdd_bus_type);
     if(ret)
-        pr_err("Error registering sbdd_bus_type with code %d", ret);
+        pr_err("Error registering sbdd_bus_type with code %d\n", ret);
     else
-        pr_info("sbdd_bus registered successfully");
+        pr_info("sbdd_bus registered successfully\n");
     return ret;
 }
 
 static void sbdd_bus_unregister(void)
 {
     bus_unregister(&sbdd_bus_type);
-    pr_info("Unregistering sbdd_bus");
+    pr_info("Unregistering sbdd_bus\n");
 }
 
+/*
+ * Structure that representing our driver in sysfs
+ */
+
 struct sbd_driver{
-    struct module *owner;
     struct device_driver driver;
+    struct driver_attribute command_attr;
 };
+
+static ssize_t execute_command(struct device_driver *driver, const char *buf,
+                               size_t count);
 
 int register_sbd_driver(struct sbd_driver *driver)
 {
     int ret = 0;
-    pr_info("Registering sbd_driver");
+    pr_info("Registering sbd_driver...\n");
     driver->driver.bus = &sbdd_bus_type;
     ret = driver_register(&driver->driver);
     if(ret){
-        pr_err("Registering sbd_driver failed with code %d", ret);
+        pr_err("Registering sbd_driver failed with code %d\n", ret);
         return ret;
     }
+    driver->command_attr.attr.name = "command";
+    driver->command_attr.attr.mode = S_IWUSR;
+    driver->command_attr.store = execute_command;
+    driver->command_attr.show = NULL;
+    ret = driver_create_file(&driver->driver, &driver->command_attr);
+    if(ret){
+        pr_err("Creating attribute failed with code %d\n", ret);
+        return ret;
+    }
+    pr_info("sbd_driver registered\n");
     return ret;
 }
 
 void unregister_sbd_driver(struct sbd_driver *driver)
 {
+    driver_remove_file(&driver->driver, &driver->command_attr);
     driver_unregister(&driver->driver);
-    pr_info("Unregistered sbd_driver");
+    pr_info("Unregistered sbd_driver\n");
 }
 
 static struct sbd_driver sbddrv = {
-    .owner = THIS_MODULE,
     .driver = {
         .name = "sbdd"
     }
 };
+
+/*
+ * Making a unified interface for user command execution
+ */
+
+enum commands {CREATE_COMMAND = 0};
+
+static const char *command_names[] = {[CREATE_COMMAND] = "create"};
+
+typedef int (*executor)(const char*, size_t);
+
+static int create_com(const char* buf, size_t count);
+
+static const executor command_execs[] = {[CREATE_COMMAND] = create_com};
+
+static int create_com(const char* buf, size_t count)
+{
+    return 0;
+}
+
+static ssize_t execute_command(struct device_driver *driver, const char *buf,
+                               size_t count)
+{
+    int i = CREATE_COMMAND;
+    pr_info("Parsing command...\n");
+    for(; i < CREATE_COMMAND + 1; i++){
+        int ret;
+        const char *name = command_names[i];
+        const size_t name_len = strlen(name);
+        char *begin = strstr(buf, name);
+        if(begin && (begin+name_len <= buf+count) &&
+                (*(begin+name_len)==' ' ||
+                 *(begin+name_len) == '\n' ||
+                 *(begin+name_len) == '\0')){
+            pr_info("Command %s parsed\n", name);
+            ret = command_execs[i](buf, count);
+            if(ret)
+                return ret;
+            else
+                return count;
+        }
+    }
+    pr_info("Unknown command\n");
+    return count;
+}
 
 #define SBDD_SECTOR_SHIFT      9
 #define SBDD_SECTOR_SIZE       (1 << SBDD_SECTOR_SHIFT)
