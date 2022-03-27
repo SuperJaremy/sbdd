@@ -24,6 +24,9 @@
 #include <linux/blk-mq.h>
 #endif
 
+
+#define SBDD_BUS_NAME "sbdd_bus"
+#define MAX_DEV_NAME_SIZE 8
 /*
  * Creating our own bus to register driver on it
  */
@@ -33,7 +36,7 @@ static int sbdd_match(struct device *dev, struct device_driver *drv);
 static int sbdd_uevent(struct device *dev, struct kobj_uevent_env *env);
 
 static struct bus_type sbdd_bus_type = {
-    .name ="sbdd_bus",
+    .name = SBDD_BUS_NAME,
     .match = sbdd_match,
     .uevent = sbdd_uevent
 };
@@ -51,10 +54,10 @@ static int sbdd_uevent(struct device *dev, struct kobj_uevent_env *env)
 static int sbdd_bus_register(void)
 {
     int ret = 0;
-    pr_info("Registering sbdd_bus");
+    pr_info("registering sbdd_bus");
     ret = bus_register(&sbdd_bus_type);
     if(ret)
-        pr_err("Error registering sbdd_bus_type with code %d\n", ret);
+        pr_err("error registering sbdd_bus_type with code %d\n", ret);
     else
         pr_info("sbdd_bus registered successfully\n");
     return ret;
@@ -63,7 +66,7 @@ static int sbdd_bus_register(void)
 static void sbdd_bus_unregister(void)
 {
     bus_unregister(&sbdd_bus_type);
-    pr_info("Unregistering sbdd_bus\n");
+    pr_info("unregistering sbdd_bus\n");
 }
 
 /*
@@ -81,7 +84,7 @@ static ssize_t execute_command(struct device_driver *driver, const char *buf,
 int register_sbd_driver(struct sbd_driver *driver)
 {
     int ret = 0;
-    pr_info("Registering sbd_driver...\n");
+    pr_info("registering sbd_driver...\n");
     driver->driver.bus = &sbdd_bus_type;
     ret = driver_register(&driver->driver);
     if(ret){
@@ -94,7 +97,8 @@ int register_sbd_driver(struct sbd_driver *driver)
     driver->command_attr.show = NULL;
     ret = driver_create_file(&driver->driver, &driver->command_attr);
     if(ret){
-        pr_err("Creating attribute failed with code %d\n", ret);
+        pr_err("creating attribute failed with code %d\n", ret);
+        driver_unregister(&driver->driver);
         return ret;
     }
     pr_info("sbd_driver registered\n");
@@ -105,7 +109,7 @@ void unregister_sbd_driver(struct sbd_driver *driver)
 {
     driver_remove_file(&driver->driver, &driver->command_attr);
     driver_unregister(&driver->driver);
-    pr_info("Unregistered sbd_driver\n");
+    pr_info("unregistered sbd_driver\n");
 }
 
 static struct sbd_driver sbddrv = {
@@ -126,28 +130,66 @@ typedef int (*executor)(const char*, size_t);
 
 static int create_com(const char* buf, size_t count);
 
+static int add_new_sbdd(unsigned long capacity_mib, char* name, size_t name_len);
+
+/*
+ * executors should parse the command's args, check them
+ * and then execute the command itself
+ */
+
 static const executor command_execs[] = {[CREATE_COMMAND] = create_com};
 
 static int create_com(const char* buf, size_t count)
 {
-    return 0;
+    const char *comm = command_names[CREATE_COMMAND];
+    const int args_num = 2;
+    const char *args = strstr(buf, comm) + strlen(comm) + 1;
+    const char *space = strstr(args, " ");
+    size_t name_len = 0;
+    char* name;
+    unsigned long capacity_mib = 0;
+    int ret = 0;
+    if(!space){
+        pr_err("wrong command format\n");
+        return -EINVAL;
+    }
+    name_len = space - args + 1;
+    if(name_len == 0){
+        pr_err("wrong command format\n");
+        return -EINVAL;
+    }
+    if(name_len - 1 > MAX_DEV_NAME_SIZE){
+        pr_err("maximal device name length is %d\n", MAX_DEV_NAME_SIZE);
+        return -EINVAL;
+    }
+    name = kzalloc(name_len, GFP_KERNEL);
+    ret = sscanf(args, "%s %lu", name, &capacity_mib);
+    if(ret < args_num){
+        kvfree(name);
+        pr_err("wrong command format\n");
+        return -EINVAL;
+    }
+    pr_debug("create command args: %s %lu\n", name, capacity_mib);
+    ret = add_new_sbdd(capacity_mib, name, name_len);
+    kvfree(name);
+    return ret;
 }
 
 static ssize_t execute_command(struct device_driver *driver, const char *buf,
                                size_t count)
 {
     int i = CREATE_COMMAND;
-    pr_info("Parsing command...\n");
+    pr_info("parsing command...\n");
     for(; i < CREATE_COMMAND + 1; i++){
         int ret;
         const char *name = command_names[i];
         const size_t name_len = strlen(name);
-        char *begin = strstr(buf, name);
-        if(begin && (begin+name_len <= buf+count) &&
-                (*(begin+name_len)==' ' ||
-                 *(begin+name_len) == '\n' ||
-                 *(begin+name_len) == '\0')){
-            pr_info("Command %s parsed\n", name);
+        const char *begin = strstr(buf, name);
+        if(begin && (begin + name_len <= buf + count) &&
+                (*(begin + name_len)==' ' ||
+                 *(begin + name_len) == '\n' ||
+                 *(begin + name_len) == '\0')){
+            pr_info("command %s parsed\n", name);
             ret = command_execs[i](buf, count);
             if(ret)
                 return ret;
@@ -155,7 +197,7 @@ static ssize_t execute_command(struct device_driver *driver, const char *buf,
                 return count;
         }
     }
-    pr_info("Unknown command\n");
+    pr_info("unknown command\n");
     return count;
 }
 
@@ -163,7 +205,8 @@ static ssize_t execute_command(struct device_driver *driver, const char *buf,
 #define SBDD_SECTOR_SIZE       (1 << SBDD_SECTOR_SHIFT)
 #define SBDD_MIB_SECTORS       (1 << (20 - SBDD_SECTOR_SHIFT))
 #define SBDD_NAME              "sbdd"
-#define SBDDEV_NAME            "sba"
+#define SBDEV_NAME             "sbd"
+#define MAX_DEVICES            16
 
 struct sbdd {
 	wait_queue_head_t       exitwait;
@@ -179,31 +222,33 @@ struct sbdd {
 #endif
 };
 
-static struct sbdd      __sbdd;
+static struct sbdd      *__devices;
+static struct sbdd      __zero_sbdd;
 static int              __sbdd_major = 0;
 static unsigned long    __sbdd_capacity_mib = 100;
 
-static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
+static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir, struct sbdd *dev)
 {
 	void *buff = page_address(bvec->bv_page) + bvec->bv_offset;
 	sector_t len = bvec->bv_len >> SBDD_SECTOR_SHIFT;
 	size_t offset;
 	size_t nbytes;
 
-	if (pos + len > __sbdd.capacity)
-		len = __sbdd.capacity - pos;
+    if (pos + len > dev->capacity){
+        len = dev->capacity - pos;
+    }
 
 	offset = pos << SBDD_SECTOR_SHIFT;
 	nbytes = len << SBDD_SECTOR_SHIFT;
 
-	spin_lock(&__sbdd.datalock);
+    spin_lock(&dev->datalock);
 
 	if (dir)
-		memcpy(__sbdd.data + offset, buff, nbytes);
+        memcpy(dev->data + offset, buff, nbytes);
 	else
-		memcpy(buff, __sbdd.data + offset, nbytes);
+        memcpy(buff, dev->data + offset, nbytes);
 
-	spin_unlock(&__sbdd.datalock);
+    spin_unlock(&dev->datalock);
 
 	pr_debug("pos=%6llu len=%4llu %s\n", pos, len, dir ? "written" : "read");
 
@@ -212,7 +257,7 @@ static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
 
 #ifdef BLK_MQ_MODE
 
-static void sbdd_xfer_rq(struct request *rq)
+static void sbdd_xfer_rq(struct request *rq, struct sbdd *dev)
 {
 	struct req_iterator iter;
 	struct bio_vec bvec;
@@ -220,23 +265,24 @@ static void sbdd_xfer_rq(struct request *rq)
 	sector_t pos = blk_rq_pos(rq);
 
 	rq_for_each_segment(bvec, rq, iter)
-		pos += sbdd_xfer(&bvec, pos, dir);
+        pos += sbdd_xfer(&bvec, pos, dir, dev);
 }
 
 static blk_status_t sbdd_queue_rq(struct blk_mq_hw_ctx *hctx,
                                   struct blk_mq_queue_data const *bd)
 {
-	if (atomic_read(&__sbdd.deleting))
+    struct sbdd *dev = bd->rq->rq_disk->private_data;
+    if (atomic_read(&dev->deleting))
 		return BLK_STS_IOERR;
 
-	atomic_inc(&__sbdd.refs_cnt);
+    atomic_inc(&dev->refs_cnt);
 
 	blk_mq_start_request(bd->rq);
-	sbdd_xfer_rq(bd->rq);
+    sbdd_xfer_rq(bd->rq, dev);
 	blk_mq_end_request(bd->rq, BLK_STS_OK);
 
-	if (atomic_dec_and_test(&__sbdd.refs_cnt))
-		wake_up(&__sbdd.exitwait);
+    if (atomic_dec_and_test(&dev->refs_cnt))
+        wake_up(&dev->exitwait);
 
 	return BLK_STS_OK;
 }
@@ -256,7 +302,7 @@ static struct blk_mq_ops const __sbdd_blk_mq_ops = {
 
 #else
 
-static void sbdd_xfer_bio(struct bio *bio)
+static void sbdd_xfer_bio(struct bio *bio, struct sbdd *dev)
 {
 	struct bvec_iter iter;
 	struct bio_vec bvec;
@@ -264,21 +310,22 @@ static void sbdd_xfer_bio(struct bio *bio)
 	sector_t pos = bio->bi_iter.bi_sector;
 
 	bio_for_each_segment(bvec, bio, iter)
-		pos += sbdd_xfer(&bvec, pos, dir);
+        pos += sbdd_xfer(&bvec, pos, dir, dev);
 }
 
 static blk_qc_t sbdd_make_request(struct request_queue *q, struct bio *bio)
 {
-	if (atomic_read(&__sbdd.deleting))
+    struct sbdd *dev = bio->bi_disk->private_data;
+    if (atomic_read(&dev->deleting))
 		return BLK_STS_IOERR;
 
-	atomic_inc(&__sbdd.refs_cnt);
+    atomic_inc(&dev->refs_cnt);
 
-	sbdd_xfer_bio(bio);
+    sbdd_xfer_bio(bio, dev);
 	bio_endio(bio);
 
-	if (atomic_dec_and_test(&__sbdd.refs_cnt))
-		wake_up(&__sbdd.exitwait);
+    if (atomic_dec_and_test(&dev->refs_cnt))
+        wake_up(&dev->exitwait);
 
 	return BLK_STS_OK;
 }
@@ -292,6 +339,107 @@ the request() function associated with the request queue of the disk.
 static struct block_device_operations const __sbdd_bdev_ops = {
 	.owner = THIS_MODULE,
 };
+
+/*
+ * In order to manage several devices with one module let's
+ * split getting major number and adding disk operations.
+ */
+
+static int sbdd_setup(struct sbdd *dev, size_t idx, unsigned long capacity_mib, char* name, size_t name_len)
+{
+    int ret = 0;
+    memset(dev, 0, sizeof(struct sbdd));
+    dev->capacity = (sector_t)capacity_mib * SBDD_MIB_SECTORS;
+
+    pr_info("allocating data\n");
+    dev->data = vmalloc(dev->capacity << SBDD_SECTOR_SHIFT);
+    if (!dev->data) {
+        pr_err("unable to alloc data\n");
+        return -ENOMEM;
+    }
+
+    spin_lock_init(&dev->datalock);
+    init_waitqueue_head(&dev->exitwait);
+
+#ifdef BLK_MQ_MODE
+    pr_info("allocating tag_set\n");
+    dev->tag_set = kzalloc(sizeof(struct blk_mq_tag_set), GFP_KERNEL);
+    if (!dev->tag_set) {
+        pr_err("unable to alloc tag_set\n");
+        return -ENOMEM;
+    }
+
+    /* Number of hardware dispatch queues */
+    dev->tag_set->nr_hw_queues = 1;
+    /* Depth of hardware dispatch queues */
+    dev->tag_set->queue_depth = 128;
+    dev->tag_set->numa_node = NUMA_NO_NODE;
+    dev->tag_set->ops = &__sbdd_blk_mq_ops;
+
+    ret = blk_mq_alloc_tag_set(_dev->tag_set);
+    if (ret) {
+        pr_err("call blk_mq_alloc_tag_set() failed with %d\n", ret);
+        return ret;
+    }
+
+    /* Creates both the hardware and the software queues and initializes structs */
+    pr_info("initing queue\n");
+    dev->q = blk_mq_init_queue(dev->tag_set);
+    if (IS_ERR(dev->q)) {
+        ret = (int)PTR_ERR(dev->q);
+        pr_err("call blk_mq_init_queue() failed witn %d\n", ret);
+        dev->q = NULL;
+        return ret;
+    }
+#else
+    pr_info("allocating queue\n");
+    dev->q = blk_alloc_queue(GFP_KERNEL);
+    if (!dev->q) {
+        pr_err("call blk_alloc_queue() failed\n");
+        return -EINVAL;
+    }
+    blk_queue_make_request(dev->q, sbdd_make_request);
+#endif /* BLK_MQ_MODE */
+
+    /* Configure queue */
+    blk_queue_logical_block_size(dev->q, SBDD_SECTOR_SIZE);
+
+    /* A disk must have at least one minor */
+    pr_info("allocating disk\n");
+    dev->gd = alloc_disk(1);
+
+    /* Configure gendisk */
+    dev->gd->queue = dev->q;
+    dev->gd->major = __sbdd_major;
+    dev->gd->first_minor = idx;
+    dev->gd->private_data = dev;
+    dev->gd->fops = &__sbdd_bdev_ops;
+    /* Represents name in /proc/partitions and /sys/block */
+    scnprintf(dev->gd->disk_name, name_len, "%s", name);
+    set_capacity(dev->gd, dev->capacity);
+
+    /*
+    Allocating gd does not make it available, add_disk() required.
+    After this call, gd methods can be called at any time. Should not be
+    called before the driver is fully initialized and ready to process reqs.
+    */
+    pr_info("adding disk\n");
+    add_disk(dev->gd);
+    return ret;
+}
+
+static int add_new_sbdd(unsigned long capacity_mib, char* name, size_t name_len){
+    u8 i = 0;
+    pr_info("adding new sbdd..");
+    for(;i < MAX_DEVICES; i++){
+        int res = memcmp(&__devices[i], &__zero_sbdd, sizeof (struct sbdd));
+        if(!res){
+            return sbdd_setup(&__devices[i], i, capacity_mib, name, name_len);
+        }
+    }
+    pr_info("too many devices\n");
+    return 1;
+}
 
 static int sbdd_create(void)
 {
@@ -307,129 +455,61 @@ static int sbdd_create(void)
 		pr_err("call register_blkdev() failed with %d\n", __sbdd_major);
 		return -EBUSY;
 	}
-
-	memset(&__sbdd, 0, sizeof(struct sbdd));
-	__sbdd.capacity = (sector_t)__sbdd_capacity_mib * SBDD_MIB_SECTORS;
-
-	pr_info("allocating data\n");
-	__sbdd.data = vmalloc(__sbdd.capacity << SBDD_SECTOR_SHIFT);
-	if (!__sbdd.data) {
-		pr_err("unable to alloc data\n");
-		return -ENOMEM;
-	}
-
-	spin_lock_init(&__sbdd.datalock);
-	init_waitqueue_head(&__sbdd.exitwait);
-
-#ifdef BLK_MQ_MODE
-	pr_info("allocating tag_set\n");
-	__sbdd.tag_set = kzalloc(sizeof(struct blk_mq_tag_set), GFP_KERNEL);
-	if (!__sbdd.tag_set) {
-		pr_err("unable to alloc tag_set\n");
-		return -ENOMEM;
-	}
-
-	/* Number of hardware dispatch queues */
-	__sbdd.tag_set->nr_hw_queues = 1;
-	/* Depth of hardware dispatch queues */
-	__sbdd.tag_set->queue_depth = 128;
-	__sbdd.tag_set->numa_node = NUMA_NO_NODE;
-	__sbdd.tag_set->ops = &__sbdd_blk_mq_ops;
-
-	ret = blk_mq_alloc_tag_set(__sbdd.tag_set);
-	if (ret) {
-		pr_err("call blk_mq_alloc_tag_set() failed with %d\n", ret);
-		return ret;
-	}
-
-	/* Creates both the hardware and the software queues and initializes structs */
-	pr_info("initing queue\n");
-	__sbdd.q = blk_mq_init_queue(__sbdd.tag_set);
-	if (IS_ERR(__sbdd.q)) {
-		ret = (int)PTR_ERR(__sbdd.q);
-		pr_err("call blk_mq_init_queue() failed witn %d\n", ret);
-		__sbdd.q = NULL;
-		return ret;
-	}
-#else
-	pr_info("allocating queue\n");
-	__sbdd.q = blk_alloc_queue(GFP_KERNEL);
-	if (!__sbdd.q) {
-		pr_err("call blk_alloc_queue() failed\n");
-		return -EINVAL;
-	}
-	blk_queue_make_request(__sbdd.q, sbdd_make_request);
-#endif /* BLK_MQ_MODE */
-
-	/* Configure queue */
-	blk_queue_logical_block_size(__sbdd.q, SBDD_SECTOR_SIZE);
-
-	/* A disk must have at least one minor */
-	pr_info("allocating disk\n");
-	__sbdd.gd = alloc_disk(1);
-
-	/* Configure gendisk */
-	__sbdd.gd->queue = __sbdd.q;
-	__sbdd.gd->major = __sbdd_major;
-	__sbdd.gd->first_minor = 0;
-	__sbdd.gd->fops = &__sbdd_bdev_ops;
-	/* Represents name in /proc/partitions and /sys/block */
-    scnprintf(__sbdd.gd->disk_name, DISK_NAME_LEN, SBDDEV_NAME);
-	set_capacity(__sbdd.gd, __sbdd.capacity);
-
-	/*
-	Allocating gd does not make it available, add_disk() required.
-	After this call, gd methods can be called at any time. Should not be
-	called before the driver is fully initialized and ready to process reqs.
-	*/
-	pr_info("adding disk\n");
-	add_disk(__sbdd.gd);
-
+    __devices = kcalloc(MAX_DEVICES,sizeof(struct sbdd), GFP_KERNEL);
+    if(!__devices){
+        pr_err("cannot allocate memory for the devices\n");
+        return -ENOMEM;
+    }
 	return ret;
 }
 
 static void sbdd_delete(void)
 {
-	atomic_set(&__sbdd.deleting, 1);
+    u8 i;
+    for(i = 0; i < MAX_DEVICES; i++){
+        if(!memcmp(&__devices[i], &__zero_sbdd, sizeof(struct sbdd)))
+            break;
+        atomic_set(&__devices[i].deleting, 1);
 
-	wait_event(__sbdd.exitwait, !atomic_read(&__sbdd.refs_cnt));
+        wait_event(__devices[i].exitwait, !atomic_read(&__devices[i].refs_cnt));
 
-	/* gd will be removed only after the last reference put */
-	if (__sbdd.gd) {
-		pr_info("deleting disk\n");
-		del_gendisk(__sbdd.gd);
-	}
+        /* gd will be removed only after the last reference put */
+        if (__devices[i].gd) {
+            pr_info("deleting disk\n");
+            del_gendisk(__devices[i].gd);
+        }
 
-	if (__sbdd.q) {
-		pr_info("cleaning up queue\n");
-		blk_cleanup_queue(__sbdd.q);
-	}
+        if (__devices[i].q) {
+            pr_info("cleaning up queue\n");
+            blk_cleanup_queue(__devices[i].q);
+        }
 
-	if (__sbdd.gd)
-		put_disk(__sbdd.gd);
+        if (__devices[i].gd)
+            put_disk(__devices[i].gd);
 
 #ifdef BLK_MQ_MODE
-	if (__sbdd.tag_set && __sbdd.tag_set->tags) {
-		pr_info("freeing tag_set\n");
-		blk_mq_free_tag_set(__sbdd.tag_set);
-	}
+        if (__devices[i].tag_set && __devices[i].tag_set->tags) {
+            pr_info("freeing tag_set\n");
+            blk_mq_free_tag_set(__devices[i].tag_set);
+        }
 
-	if (__sbdd.tag_set)
-		kfree(__sbdd.tag_set);
+        if (__devices[i].tag_set)
+            kfree(__devices[i].tag_set);
 #endif
 
-	if (__sbdd.data) {
-		pr_info("freeing data\n");
-		vfree(__sbdd.data);
-	}
+        if (__devices[i].data) {
+            pr_info("freeing data\n");
+            vfree(__devices[i].data);
+        }
 
-	memset(&__sbdd, 0, sizeof(struct sbdd));
-
+        memset(&__devices[i], 0, sizeof(struct sbdd));
+    }
 	if (__sbdd_major > 0) {
 		pr_info("unregistering blkdev\n");
 		unregister_blkdev(__sbdd_major, SBDD_NAME);
 		__sbdd_major = 0;
 	}
+    kvfree(__devices);
 }
 
 /*
@@ -440,6 +520,7 @@ There is also __initdata note, same but used for variables.
 static int __init sbdd_init(void)
 {
 	int ret = 0;
+    memset(&__zero_sbdd, 0, sizeof (struct sbdd));
 
 	pr_info("starting initialization...\n");
     ret = sbdd_bus_register();
