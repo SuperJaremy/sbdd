@@ -62,9 +62,33 @@ static struct bus_type sbdd_bus_type = {
     .uevent = sbdd_uevent
 };
 
+static void sbdd_bus_release(struct device *dev)
+{
+    pr_debug("sbdd_bus_dev released\n");
+}
+
+static struct device sbdd_bus = {
+    .init_name = "sbdd_bus_dev",
+    .release = sbdd_bus_release
+};
+
+struct sbd_driver{
+    struct device_driver driver;
+    struct driver_attribute command_attr;
+};
+
+static struct sbd_driver sbddrv = {
+    .driver = {
+        .name = "sbdd"
+    }
+};
+
 static int sbdd_match(struct device *dev, struct device_driver *drv)
 {
-    return !strcmp(dev->type->name, drv->name);
+    struct sbd_driver *driver = dev->driver_data;
+    if(!driver)
+        return 0;
+    return !strcmp(driver->driver.name, drv->name);
 }
 
 static int sbdd_uevent(struct device *dev, struct kobj_uevent_env *env)
@@ -81,11 +105,20 @@ static int sbdd_bus_register(void)
         pr_err("error registering sbdd_bus_type with code %d\n", ret);
     else
         pr_info("sbdd_bus registered successfully\n");
+    ret = device_register(&sbdd_bus);
+    if(ret){
+        pr_err("error registering bus device with code %d\n", ret);
+        bus_unregister(&sbdd_bus_type);
+    }
+    else
+        pr_info("bus device registered successfully");
     return ret;
 }
 
 static void sbdd_bus_unregister(void)
 {
+    device_unregister(&sbdd_bus);
+    pr_info("unregistered sbdd_bus_dev");
     bus_unregister(&sbdd_bus_type);
     pr_info("unregistering sbdd_bus\n");
 }
@@ -93,11 +126,6 @@ static void sbdd_bus_unregister(void)
 /*
  * Structure that representing our driver in sysfs
  */
-
-struct sbd_driver{
-    struct device_driver driver;
-    struct driver_attribute command_attr;
-};
 
 static ssize_t execute_command(struct device_driver *driver, const char *buf,
                                size_t count);
@@ -109,7 +137,7 @@ int register_sbd_driver(struct sbd_driver *driver)
     driver->driver.bus = &sbdd_bus_type;
     ret = driver_register(&driver->driver);
     if(ret){
-        pr_err("Registering sbd_driver failed with code %d\n", ret);
+        pr_err("registering sbd_driver failed with code %d\n", ret);
         return ret;
     }
     if(__mode == AUTO)
@@ -135,12 +163,6 @@ void unregister_sbd_driver(struct sbd_driver *driver)
     driver_unregister(&driver->driver);
     pr_info("unregistered sbd_driver\n");
 }
-
-static struct sbd_driver sbddrv = {
-    .driver = {
-        .name = "sbdd"
-    }
-};
 
 /*
  * Making a unified interface for user command execution
@@ -242,6 +264,7 @@ struct sbdd {
 	u8                      *data;
 	struct gendisk          *gd;
 	struct request_queue    *q;
+    struct device           *dev;
 #ifdef BLK_MQ_MODE
 	struct blk_mq_tag_set   *tag_set;
 #endif
@@ -370,6 +393,34 @@ static struct block_device_operations const __sbdd_bdev_ops = {
  * split getting major number and adding disk operations.
  */
 
+static void sbdd_device_release(struct device *dev)
+{}
+
+static int sbdd_device_register(struct sbdd *dev, char* name)
+{
+    int ret = 0;
+    dev->dev = kzalloc(sizeof (struct device), GFP_KERNEL);
+    if(!dev->dev){
+        pr_err("cannot allocate memory for sysfs device enetry");
+        return -ENOMEM;
+    }
+    pr_info("registering %s on sysfs", name);
+    dev->dev->init_name = name;
+    dev_set_drvdata(dev->dev, &sbddrv);
+    dev->dev->bus = &sbdd_bus_type;
+    dev->dev->parent = &sbdd_bus;
+    dev->dev->release = sbdd_device_release;
+    ret = device_register(dev->dev);
+    if(ret)
+        pr_err("registering %s failed with code %d\n", name, ret);
+    return ret;
+}
+
+static void sbdd_device_unregister(struct sbdd *dev){
+    device_unregister(dev->dev);
+    kvfree(dev->dev);
+}
+
 static int sbdd_setup(struct sbdd *dev, size_t idx, unsigned long capacity_mib, char* name, size_t name_len)
 {
     int ret = 0;
@@ -450,6 +501,9 @@ static int sbdd_setup(struct sbdd *dev, size_t idx, unsigned long capacity_mib, 
     */
     pr_info("adding disk\n");
     add_disk(dev->gd);
+    if(!ret){
+        ret = sbdd_device_register(dev, name);
+    }
     return ret;
 }
 
@@ -506,6 +560,8 @@ static void sbdd_delete(void)
 
         wait_event(__devices[i].exitwait, !atomic_read(&__devices[i].refs_cnt));
 
+        sbdd_device_unregister(&__devices[i]);
+
         /* gd will be removed only after the last reference put */
         if (__devices[i].gd) {
             pr_info("deleting disk\n");
@@ -534,7 +590,6 @@ static void sbdd_delete(void)
             pr_info("freeing data\n");
             vfree(__devices[i].data);
         }
-
         memset(&__devices[i], 0, sizeof(struct sbdd));
     }
 	if (__sbdd_major > 0) {
