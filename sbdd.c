@@ -26,9 +26,10 @@
 
 static unsigned int     __pre_mode = 0;
 enum mode{AUTO = 0, USER};
-static enum mode __mode = AUTO;
+static enum mode        __mode = AUTO;
 
-static int check_mode(void){
+static int check_mode(void)
+{
     if(__pre_mode == 0 || __pre_mode == 1){
         __mode = __pre_mode;
         switch(__mode){
@@ -72,7 +73,7 @@ static struct device sbdd_bus = {
     .release = sbdd_bus_release
 };
 
-struct sbd_driver{
+struct sbd_driver {
     struct device_driver driver;
     struct driver_attribute command_attr;
 };
@@ -85,7 +86,7 @@ static struct sbd_driver sbddrv = {
 
 static int sbdd_match(struct device *dev, struct device_driver *drv)
 {
-    struct sbd_driver *driver = dev->driver_data;
+    struct sbd_driver *driver = dev_get_drvdata(dev);
     if(!driver)
         return 0;
     return !strcmp(driver->driver.name, drv->name);
@@ -140,8 +141,6 @@ int register_sbd_driver(struct sbd_driver *driver)
         pr_err("registering sbd_driver failed with code %d\n", ret);
         return ret;
     }
-    if(__mode == AUTO)
-        return ret;
     driver->command_attr.attr.name = "command";
     driver->command_attr.attr.mode = S_IWUSR;
     driver->command_attr.store = execute_command;
@@ -158,23 +157,57 @@ int register_sbd_driver(struct sbd_driver *driver)
 
 void unregister_sbd_driver(struct sbd_driver *driver)
 {
-    if(__mode == USER)
-        driver_remove_file(&driver->driver, &driver->command_attr);
+    driver_remove_file(&driver->driver, &driver->command_attr);
     driver_unregister(&driver->driver);
     pr_info("unregistered sbd_driver\n");
 }
+
+
+
+#define SBDD_SECTOR_SHIFT      9
+#define SBDD_SECTOR_SIZE       (1 << SBDD_SECTOR_SHIFT)
+#define SBDD_MIB_SECTORS       (1 << (20 - SBDD_SECTOR_SHIFT))
+#define SBDD_NAME              "sbdd"
+#define SBDEV_NAME             "sbd"
+#define MAX_DEVICES            16
+#define DEFAULT_CAPACITY_MIB   100
+
+struct sbdd {
+    char                    *name;
+	wait_queue_head_t       exitwait;
+	spinlock_t              datalock;
+	atomic_t                deleting;
+	atomic_t                refs_cnt;
+	sector_t                capacity;
+	u8                      *data;
+	struct gendisk          *gd;
+	struct request_queue    *q;
+    struct device           *dev;
+#ifdef BLK_MQ_MODE
+	struct blk_mq_tag_set   *tag_set;
+#endif
+};
+
+static struct sbdd      *__devices;
+static struct sbdd      __zero_sbdd;
+static int              __sbdd_major = 0;
+static unsigned long    __sbdd_capacity_mib = 100;
 
 /*
  * Making a unified interface for user command execution
  */
 
-enum commands {CREATE_COMMAND = 0};
+#define COMMAND_NUMBER 2
 
-static const char *command_names[] = {[CREATE_COMMAND] = "create"};
+enum commands {CREATE_COMMAND = 0, CHANGE_MODE_COMMAND};
+
+static const char *command_names[] = {[CREATE_COMMAND] = "create", [CHANGE_MODE_COMMAND] = "change_mode"};
 
 typedef int (*executor)(const char*, size_t);
 
 static int create_com(const char* buf, size_t count);
+
+static int change_mode_com(const char* buf, size_t count);
 
 static int add_new_sbdd(unsigned long capacity_mib, char* name, size_t name_len);
 
@@ -183,7 +216,33 @@ static int add_new_sbdd(unsigned long capacity_mib, char* name, size_t name_len)
  * and then execute the command itself
  */
 
-static const executor command_execs[] = {[CREATE_COMMAND] = create_com};
+static const executor command_execs[] = {[CREATE_COMMAND] = create_com, [CHANGE_MODE_COMMAND] = change_mode_com};
+
+static ssize_t execute_command(struct device_driver *driver, const char *buf,
+                               size_t count)
+{
+    int i = CREATE_COMMAND;
+    pr_info("parsing command...\n");
+    for(; i < COMMAND_NUMBER; i++){
+        int ret;
+        const char *name = command_names[i];
+        const size_t name_len = strlen(name);
+        const char *begin = strstr(buf, name);
+        if(begin && (begin + name_len <= buf + count) &&
+                (*(begin + name_len)==' ' ||
+                 *(begin + name_len) == '\n' ||
+                 *(begin + name_len) == '\0')){
+            pr_info("command %s parsed\n", name);
+            ret = command_execs[i](buf, count);
+            if(ret)
+                return ret;
+            else
+                return count;
+        }
+    }
+    pr_info("unknown command\n");
+    return count;
+}
 
 static int create_com(const char* buf, size_t count)
 {
@@ -195,6 +254,10 @@ static int create_com(const char* buf, size_t count)
     char* name;
     unsigned long capacity_mib = 0;
     int ret = 0;
+    if(__mode == AUTO){
+        pr_warn("create command is unavailable in auto mode");
+        return 0;
+    }
     if(!space){
         pr_err("wrong command format\n");
         return -EINVAL;
@@ -217,63 +280,57 @@ static int create_com(const char* buf, size_t count)
     }
     pr_debug("create command args: %s %lu\n", name, capacity_mib);
     ret = add_new_sbdd(capacity_mib, name, name_len);
+    if(!ret)
+        pr_info("device %s created", name);
     kvfree(name);
     return ret;
 }
 
-static ssize_t execute_command(struct device_driver *driver, const char *buf,
-                               size_t count)
+static struct sbdd *find_device_by_name(char *name);
+
+static int change_mode_com(const char* buf, size_t count)
 {
-    int i = CREATE_COMMAND;
-    pr_info("parsing command...\n");
-    for(; i < CREATE_COMMAND + 1; i++){
-        int ret;
-        const char *name = command_names[i];
-        const size_t name_len = strlen(name);
-        const char *begin = strstr(buf, name);
-        if(begin && (begin + name_len <= buf + count) &&
-                (*(begin + name_len)==' ' ||
-                 *(begin + name_len) == '\n' ||
-                 *(begin + name_len) == '\0')){
-            pr_info("command %s parsed\n", name);
-            ret = command_execs[i](buf, count);
-            if(ret)
-                return ret;
-            else
-                return count;
-        }
+    const char *comm = command_names[CHANGE_MODE_COMMAND];
+    const int args_num = 2;
+    const char *args = strstr(buf, comm) + strlen(comm) + 1;
+    const char *space = strstr(args, " ");
+    size_t name_len = 0;
+    char* name;
+    int mode = 0;
+    int ret = 0;
+    struct sbdd *dev;
+    if(!space){
+        pr_err("wrong command format\n");
+        return -EINVAL;
     }
-    pr_info("unknown command\n");
-    return count;
+    name_len = space - args + 1;
+    if(name_len == 0){
+        pr_err("wrong command format\n");
+        return -EINVAL;
+    }
+    name = kzalloc(name_len, GFP_KERNEL);
+    ret = sscanf(args, "%s %d", name, &mode);
+    if(ret < args_num){
+        kvfree(name);
+        pr_err("wrong command format\n");
+        return -EINVAL;
+    }
+    pr_debug("change command args: %s, %d", name, mode);
+    if(mode != 0 && mode != 1){
+        pr_err("device mode can be 0 or 1");
+        kvfree(name);
+        return ret;
+    }
+    dev = find_device_by_name(name);
+    if(!dev){
+        pr_warn("device with name %s not found", name);
+        return 0;
+    }
+    set_disk_ro(dev->gd, mode);
+    pr_info("device %s is now in mode %d", name, mode);
+    kvfree(name);
+    return 0;
 }
-
-#define SBDD_SECTOR_SHIFT      9
-#define SBDD_SECTOR_SIZE       (1 << SBDD_SECTOR_SHIFT)
-#define SBDD_MIB_SECTORS       (1 << (20 - SBDD_SECTOR_SHIFT))
-#define SBDD_NAME              "sbdd"
-#define SBDEV_NAME             "sbd"
-#define MAX_DEVICES            16
-#define DEFAULT_CAPACITY_MIB   100
-
-struct sbdd {
-	wait_queue_head_t       exitwait;
-	spinlock_t              datalock;
-	atomic_t                deleting;
-	atomic_t                refs_cnt;
-	sector_t                capacity;
-	u8                      *data;
-	struct gendisk          *gd;
-	struct request_queue    *q;
-    struct device           *dev;
-#ifdef BLK_MQ_MODE
-	struct blk_mq_tag_set   *tag_set;
-#endif
-};
-
-static struct sbdd      *__devices;
-static struct sbdd      __zero_sbdd;
-static int              __sbdd_major = 0;
-static unsigned long    __sbdd_capacity_mib = 100;
 
 static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir, struct sbdd *dev)
 {
@@ -291,7 +348,7 @@ static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir, struct sb
 
     spin_lock(&dev->datalock);
 
-	if (dir)
+    if (dir)
         memcpy(dev->data + offset, buff, nbytes);
 	else
         memcpy(buff, dev->data + offset, nbytes);
@@ -324,15 +381,14 @@ static blk_status_t sbdd_queue_rq(struct blk_mq_hw_ctx *hctx,
 		return BLK_STS_IOERR;
 
     atomic_inc(&dev->refs_cnt);
-
-	blk_mq_start_request(bd->rq);
+    blk_mq_start_request(bd->rq);
     sbdd_xfer_rq(bd->rq, dev);
-	blk_mq_end_request(bd->rq, BLK_STS_OK);
+    blk_mq_end_request(bd->rq, BLK_STS_OK);
 
     if (atomic_dec_and_test(&dev->refs_cnt))
         wake_up(&dev->exitwait);
 
-	return BLK_STS_OK;
+    return BLK_STS_OK;
 }
 
 static struct blk_mq_ops const __sbdd_blk_mq_ops = {
@@ -368,14 +424,13 @@ static blk_qc_t sbdd_make_request(struct request_queue *q, struct bio *bio)
 		return BLK_STS_IOERR;
 
     atomic_inc(&dev->refs_cnt);
-
     sbdd_xfer_bio(bio, dev);
 	bio_endio(bio);
 
     if (atomic_dec_and_test(&dev->refs_cnt))
         wake_up(&dev->exitwait);
 
-	return BLK_STS_OK;
+    return BLK_STS_OK;
 }
 
 #endif /* BLK_MQ_MODE */
@@ -405,7 +460,7 @@ static int sbdd_device_register(struct sbdd *dev, char* name)
         return -ENOMEM;
     }
     pr_info("registering %s on sysfs", name);
-    dev->dev->init_name = name;
+    dev_set_name(dev->dev, "%s", name);
     dev_set_drvdata(dev->dev, &sbddrv);
     dev->dev->bus = &sbdd_bus_type;
     dev->dev->parent = &sbdd_bus;
@@ -416,9 +471,11 @@ static int sbdd_device_register(struct sbdd *dev, char* name)
     return ret;
 }
 
-static void sbdd_device_unregister(struct sbdd *dev){
+static void sbdd_device_unregister(struct sbdd *dev)
+{
     device_unregister(dev->dev);
     kvfree(dev->dev);
+    kvfree(dev->name);
 }
 
 static int sbdd_setup(struct sbdd *dev, size_t idx, unsigned long capacity_mib, char* name, size_t name_len)
@@ -504,10 +561,17 @@ static int sbdd_setup(struct sbdd *dev, size_t idx, unsigned long capacity_mib, 
     if(!ret){
         ret = sbdd_device_register(dev, name);
     }
+    dev->name = kzalloc(name_len, GFP_KERNEL);
+    if(!name){
+        pr_err("cannot allocate memory for device name\n");
+        return -ENOMEM;
+    }
+    scnprintf(dev->name, name_len, "%s", name);
     return ret;
 }
 
-static int add_new_sbdd(unsigned long capacity_mib, char* name, size_t name_len){
+static int add_new_sbdd(unsigned long capacity_mib, char* name, size_t name_len)
+{
     u8 i = 0;
     pr_info("adding new sbdd..");
     for(;i < MAX_DEVICES; i++){
@@ -598,6 +662,17 @@ static void sbdd_delete(void)
 		__sbdd_major = 0;
 	}
     kvfree(__devices);
+}
+
+static struct sbdd *find_device_by_name(char *name){
+    int i;
+    for(i = 0; i < MAX_DEVICES; i++){
+        if(!memcmp(&__devices[i], &__zero_sbdd, sizeof(struct sbdd)))
+            break;
+        if(!strcmp(name, __devices[i].name))
+            return &__devices[i];
+    }
+    return NULL;
 }
 
 /*
