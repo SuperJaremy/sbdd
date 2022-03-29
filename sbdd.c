@@ -100,7 +100,7 @@ static int sbdd_uevent(struct device *dev, struct kobj_uevent_env *env)
 static int sbdd_bus_register(void)
 {
     int ret = 0;
-    pr_info("registering sbdd_bus");
+    pr_info("registering sbdd_bus\n");
     ret = bus_register(&sbdd_bus_type);
     if(ret)
         pr_err("error registering sbdd_bus_type with code %d\n", ret);
@@ -112,24 +112,24 @@ static int sbdd_bus_register(void)
         bus_unregister(&sbdd_bus_type);
     }
     else
-        pr_info("bus device registered successfully");
+        pr_info("bus device registered successfully\n");
     return ret;
 }
 
 static void sbdd_bus_unregister(void)
 {
     device_unregister(&sbdd_bus);
-    pr_info("unregistered sbdd_bus_dev");
+    pr_info("unregistered sbdd_bus_dev\n");
     bus_unregister(&sbdd_bus_type);
     pr_info("unregistering sbdd_bus\n");
 }
 
+static ssize_t execute_command(struct device_driver *driver, const char *buf,
+                               size_t count);
+
 /*
  * Structure that representing our driver in sysfs
  */
-
-static ssize_t execute_command(struct device_driver *driver, const char *buf,
-                               size_t count);
 
 int register_sbd_driver(struct sbd_driver *driver)
 {
@@ -170,12 +170,12 @@ void unregister_sbd_driver(struct sbd_driver *driver)
 #define SBDD_NAME              "sbdd"
 #define SBDEV_NAME             "sbd"
 #define MAX_DEVICES            16
-#define DEFAULT_CAPACITY_MIB   100
 
 struct sbdd {
     char                    *name;
 	wait_queue_head_t       exitwait;
 	spinlock_t              datalock;
+    spinlock_t              transferring;
 	atomic_t                deleting;
 	atomic_t                refs_cnt;
 	sector_t                capacity;
@@ -189,9 +189,10 @@ struct sbdd {
 };
 
 static struct sbdd      *__devices;
-static struct sbdd      __zero_sbdd;
+static struct sbdd      __zero_sbdd = {0};
 static int              __sbdd_major = 0;
 static unsigned long    __sbdd_capacity_mib = 100;
+static spinlock_t       __creating_new_disk;
 
 /*
  * Making a unified interface for user command execution
@@ -255,7 +256,7 @@ static int create_com(const char* buf, size_t count)
     unsigned long capacity_mib = 0;
     int ret = 0;
     if(__mode == AUTO){
-        pr_warn("create command is unavailable in auto mode");
+        pr_warn("create command is unavailable in auto mode\n");
         return 0;
     }
     if(!space){
@@ -281,7 +282,7 @@ static int create_com(const char* buf, size_t count)
     pr_debug("create command args: %s %lu\n", name, capacity_mib);
     ret = add_new_sbdd(capacity_mib, name, name_len);
     if(!ret)
-        pr_info("device %s created", name);
+        pr_info("device %s created\n", name);
     kvfree(name);
     return ret;
 }
@@ -315,19 +316,26 @@ static int change_mode_com(const char* buf, size_t count)
         pr_err("wrong command format\n");
         return -EINVAL;
     }
-    pr_debug("change command args: %s, %d", name, mode);
+    pr_debug("change command args: %s, %d\n", name, mode);
     if(mode != 0 && mode != 1){
-        pr_err("device mode can be 0 or 1");
+        pr_err("device mode can be 0 or 1\n");
         kvfree(name);
         return ret;
     }
     dev = find_device_by_name(name);
     if(!dev){
-        pr_warn("device with name %s not found", name);
+        pr_warn("device with name %s not found\n", name);
         return 0;
     }
+    if(atomic_read(&dev->deleting)){
+        pr_warn("device %s is being deleted\n", name);
+        kvfree(name);
+        return 1;
+    }
+    spin_lock(&dev->transferring);
     set_disk_ro(dev->gd, mode);
-    pr_info("device %s is now in mode %d", name, mode);
+    spin_unlock(&dev->transferring);
+    pr_info("device %s is now in mode %d\n", name, mode);
     kvfree(name);
     return 0;
 }
@@ -380,6 +388,8 @@ static blk_status_t sbdd_queue_rq(struct blk_mq_hw_ctx *hctx,
     if (atomic_read(&dev->deleting))
 		return BLK_STS_IOERR;
 
+    spin_lock(&dev->transferring);
+
     atomic_inc(&dev->refs_cnt);
     blk_mq_start_request(bd->rq);
     sbdd_xfer_rq(bd->rq, dev);
@@ -387,6 +397,8 @@ static blk_status_t sbdd_queue_rq(struct blk_mq_hw_ctx *hctx,
 
     if (atomic_dec_and_test(&dev->refs_cnt))
         wake_up(&dev->exitwait);
+
+    spin_unlock(&dev->transferring);
 
     return BLK_STS_OK;
 }
@@ -420,8 +432,11 @@ static void sbdd_xfer_bio(struct bio *bio, struct sbdd *dev)
 static blk_qc_t sbdd_make_request(struct request_queue *q, struct bio *bio)
 {
     struct sbdd *dev = bio->bi_disk->private_data;
-    if (atomic_read(&dev->deleting))
+    spin_lock(&dev->transferring);
+    if (atomic_read(&dev->deleting)){
+        spin_unlock(&dev->transferring);
 		return BLK_STS_IOERR;
+    }
 
     atomic_inc(&dev->refs_cnt);
     sbdd_xfer_bio(bio, dev);
@@ -430,6 +445,7 @@ static blk_qc_t sbdd_make_request(struct request_queue *q, struct bio *bio)
     if (atomic_dec_and_test(&dev->refs_cnt))
         wake_up(&dev->exitwait);
 
+    spin_unlock(&dev->transferring);
     return BLK_STS_OK;
 }
 
@@ -456,10 +472,10 @@ static int sbdd_device_register(struct sbdd *dev, char* name)
     int ret = 0;
     dev->dev = kzalloc(sizeof (struct device), GFP_KERNEL);
     if(!dev->dev){
-        pr_err("cannot allocate memory for sysfs device enetry");
+        pr_err("cannot allocate memory for sysfs device enetry\n");
         return -ENOMEM;
     }
-    pr_info("registering %s on sysfs", name);
+    pr_info("registering %s on sysfs\n", name);
     dev_set_name(dev->dev, "%s", name);
     dev_set_drvdata(dev->dev, &sbddrv);
     dev->dev->bus = &sbdd_bus_type;
@@ -492,6 +508,7 @@ static int sbdd_setup(struct sbdd *dev, size_t idx, unsigned long capacity_mib, 
     }
 
     spin_lock_init(&dev->datalock);
+    spin_lock_init(&dev->transferring);
     init_waitqueue_head(&dev->exitwait);
 
 #ifdef BLK_MQ_MODE
@@ -570,17 +587,37 @@ static int sbdd_setup(struct sbdd *dev, size_t idx, unsigned long capacity_mib, 
     return ret;
 }
 
+static struct sbdd *find_device_by_name(char *name){
+    int i;
+    for(i = 0; i < MAX_DEVICES; i++){
+        if(!memcmp(&__devices[i], &__zero_sbdd, sizeof(struct sbdd)))
+            break;
+        if(!strcmp(name, __devices[i].name))
+            return &__devices[i];
+    }
+    return NULL;
+}
+
 static int add_new_sbdd(unsigned long capacity_mib, char* name, size_t name_len)
 {
-    u8 i = 0;
-    pr_info("adding new sbdd..");
+    int i = 0;
+    spin_lock(&__creating_new_disk);
+    if(find_device_by_name(name)){
+        pr_err("Device with name %s already exists\n", name);
+        spin_unlock(&__creating_new_disk);
+        return -EINVAL;
+    }
+    pr_info("adding new sbdd..\n");
+
     for(;i < MAX_DEVICES; i++){
         int res = memcmp(&__devices[i], &__zero_sbdd, sizeof (struct sbdd));
         if(!res){
+            spin_unlock(&__creating_new_disk);
             return sbdd_setup(&__devices[i], i, capacity_mib, name, name_len);
         }
     }
     pr_info("too many devices\n");
+    spin_unlock(&__creating_new_disk);
     return 1;
 }
 
@@ -608,10 +645,48 @@ static int sbdd_create(void)
         for(i = 0; i < MAX_DEVICES; i++){
             char name[5] = {0};
             sprintf(name, "%s%x", SBDEV_NAME, i);
-            add_new_sbdd(DEFAULT_CAPACITY_MIB, name, 5);
+            add_new_sbdd(__sbdd_capacity_mib, name, 5);
         }
     }
 	return ret;
+}
+
+static void sbdd_destroy(struct sbdd *dev){
+    atomic_set(&dev->deleting, 1);
+
+    wait_event(dev->exitwait, !atomic_read(&dev->refs_cnt));
+
+    sbdd_device_unregister(dev);
+
+    /* gd will be removed only after the last reference put */
+    if (dev->gd) {
+        pr_info("deleting disk\n");
+        del_gendisk(dev->gd);
+    }
+
+    if (dev->q) {
+        pr_info("cleaning up queue\n");
+        blk_cleanup_queue(dev->q);
+    }
+
+    if (dev->gd)
+        put_disk(dev->gd);
+
+#ifdef BLK_MQ_MODE
+    if (dev->tag_set && dev->tag_set->tags) {
+        pr_info("freeing tag_set\n");
+        blk_mq_free_tag_set(dev->tag_set);
+    }
+
+    if (dev->tag_set)
+        kfree(dev->tag_set);
+#endif
+
+    if (dev->data) {
+        pr_info("freeing data\n");
+        vfree(dev->data);
+    }
+    memset(dev, 0, sizeof(struct sbdd));
 }
 
 static void sbdd_delete(void)
@@ -620,41 +695,7 @@ static void sbdd_delete(void)
     for(i = 0; i < MAX_DEVICES; i++){
         if(!memcmp(&__devices[i], &__zero_sbdd, sizeof(struct sbdd)))
             break;
-        atomic_set(&__devices[i].deleting, 1);
-
-        wait_event(__devices[i].exitwait, !atomic_read(&__devices[i].refs_cnt));
-
-        sbdd_device_unregister(&__devices[i]);
-
-        /* gd will be removed only after the last reference put */
-        if (__devices[i].gd) {
-            pr_info("deleting disk\n");
-            del_gendisk(__devices[i].gd);
-        }
-
-        if (__devices[i].q) {
-            pr_info("cleaning up queue\n");
-            blk_cleanup_queue(__devices[i].q);
-        }
-
-        if (__devices[i].gd)
-            put_disk(__devices[i].gd);
-
-#ifdef BLK_MQ_MODE
-        if (__devices[i].tag_set && __devices[i].tag_set->tags) {
-            pr_info("freeing tag_set\n");
-            blk_mq_free_tag_set(__devices[i].tag_set);
-        }
-
-        if (__devices[i].tag_set)
-            kfree(__devices[i].tag_set);
-#endif
-
-        if (__devices[i].data) {
-            pr_info("freeing data\n");
-            vfree(__devices[i].data);
-        }
-        memset(&__devices[i], 0, sizeof(struct sbdd));
+        sbdd_destroy(&__devices[i]);
     }
 	if (__sbdd_major > 0) {
 		pr_info("unregistering blkdev\n");
@@ -662,17 +703,6 @@ static void sbdd_delete(void)
 		__sbdd_major = 0;
 	}
     kvfree(__devices);
-}
-
-static struct sbdd *find_device_by_name(char *name){
-    int i;
-    for(i = 0; i < MAX_DEVICES; i++){
-        if(!memcmp(&__devices[i], &__zero_sbdd, sizeof(struct sbdd)))
-            break;
-        if(!strcmp(name, __devices[i].name))
-            return &__devices[i];
-    }
-    return NULL;
 }
 
 /*
@@ -685,7 +715,7 @@ static int __init sbdd_init(void)
 
 	int ret = 0;
     memset(&__zero_sbdd, 0, sizeof (struct sbdd));
-
+    spin_lock_init(&__creating_new_disk);
 	pr_info("starting initialization...\n");
     check_mode();
     ret = sbdd_bus_register();
